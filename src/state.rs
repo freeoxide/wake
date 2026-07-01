@@ -124,7 +124,6 @@ mod tests {
         let paths = Paths {
             state: dir.join("does-not-exist.json"),
             socket: dir.join("s.sock"),
-            pending: dir.join("p.json"),
             lock: dir.join("l.lock"),
             dir: dir.clone(),
         };
@@ -141,7 +140,6 @@ mod tests {
         let paths = Paths {
             state: dir.join("state.json"),
             socket: dir.join("s.sock"),
-            pending: dir.join("p.json"),
             lock: dir.join("l.lock"),
             dir: dir.clone(),
         };
@@ -169,7 +167,6 @@ mod tests {
         let paths = Paths {
             state: dir.join("state.json"),
             socket: dir.join("s.sock"),
-            pending: dir.join("p.json"),
             lock: dir.join("l.lock"),
             dir: dir.clone(),
         };

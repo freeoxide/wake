@@ -119,10 +119,10 @@ fn run(cli: &Cli) -> Result<()> {
         ),
         Commands::Status => cmd_status(cli),
         Commands::Doctor => cmd_doctor(cli),
-        Commands::Daemon => {
+        Commands::Daemon { pending } => {
             // Hidden internal entry point. Run the daemon loop directly; its
             // own error reporting (and exit) is handled by `main`.
-            daemon::daemon_main()
+            daemon::daemon_main(&pending)
         }
     }
 }

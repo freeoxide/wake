@@ -35,9 +35,6 @@ pub struct Paths {
     pub state: PathBuf,
     /// `dir/oxiwake.sock` — the IPC socket (Unix socket on Linux).
     pub socket: PathBuf,
-    /// `dir/pending.json` — the request hand-off file the CLI writes so the
-    /// freshly-spawned daemon knows what lock to take.
-    pub pending: PathBuf,
     /// `dir/oxiwake.lock` — the singleton advisory lock (flock on Linux,
     /// `LockFileEx` on Windows) the daemon holds for its entire lifetime. It is
     /// the atomic mutex that ensures two racing `ow on` invocations can never
@@ -84,7 +81,6 @@ impl Paths {
         }
 
         let state = dir.join("state.json");
-        let pending = dir.join("pending.json");
         // The IPC socket name is platform-neutral; on Linux this is a Unix
         // domain socket.
         let socket = dir.join("oxiwake.sock");
@@ -94,7 +90,6 @@ impl Paths {
             dir,
             state,
             socket,
-            pending,
             lock,
         })
     }

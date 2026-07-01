@@ -17,12 +17,14 @@
 //! clears the power request, so the OS lock is released exactly when the
 //! daemon stops, never sooner, and never leaked.
 //!
-//! # The pending.json hand-off
+//! # The per-invocation pending hand-off
 //!
 //! Because the daemon is a freshly-spawned child, it cannot inherit the
 //! caller's in-memory `WakeRequest` or the timestamp the caller chose. Instead
-//! the CLI writes a small `pending.json` (`{"request": …, "started_unix": …}`)
-//! before spawning, and [`daemon_main`] reads it back. `started_unix` is taken
+//! the CLI writes a small `pending.{pid}.json` (`{"request": …,
+//! "started_unix": …}`) — keyed on the CLI's own pid so two concurrent `ow on`
+//! invocations never overwrite each other's request — and passes that path to
+//! the daemon it spawns. [`daemon_main`] reads it back. `started_unix` is taken
 //! from the caller (which may pass `SystemTime::now`) rather than read inside
 //! the library, so daemon logic stays deterministic and testable.
 
@@ -78,13 +80,13 @@ struct PendingRequest {
 /// [`OxiwakeError::State`] if the runtime directory cannot be resolved or
 /// `pending.json` is missing/unparseable; otherwise whatever [`run_daemon`]
 /// returns.
-pub fn daemon_main() -> Result<()> {
+pub fn daemon_main(pending_path: &std::path::Path) -> Result<()> {
     // Wrap the real work so that, on any startup failure, we publish the error
     // to a `startup_error` file the spawning CLI can read. The detached daemon's
     // stderr is /dev/null, so without this the parent only ever sees a generic
     // timeout; this is what makes `ow on` report the *real* reason (e.g. a
     // PolicyKit denial of the logind inhibitor) instead of "did not come up".
-    let result = daemon_main_inner();
+    let result = daemon_main_inner(pending_path);
     if let Err(ref e) = result {
         if let Ok(paths) = Paths::resolve() {
             let _ = write_startup_error(&paths, &e.to_string());
@@ -93,16 +95,23 @@ pub fn daemon_main() -> Result<()> {
     result
 }
 
-fn daemon_main_inner() -> Result<()> {
+fn daemon_main_inner(pending_path: &std::path::Path) -> Result<()> {
     let paths = Paths::resolve()?;
     // Clear any startup error left by a previous, failed attempt so the parent
     // does not read a stale reason on this run.
     let _ = clear_startup_error(&paths);
-    let pending = read_pending(&paths)?
-        .ok_or_else(|| OxiwakeError::State("no pending request found for daemon".to_string()))?;
+    let pending = read_pending(pending_path)?.ok_or_else(|| {
+        OxiwakeError::State(format!(
+            "no pending request found for daemon at {}",
+            pending_path.display()
+        ))
+    })?;
+    // Consume the hand-off file immediately: the request is now in memory, and
+    // removing it now keeps the runtime dir clean for the daemon's whole run and
+    // frees this per-invocation name.
+    let _ = std::fs::remove_file(pending_path);
     let backend = backend::pick(&pending.request)?;
-    run_daemon(backend, &pending.request, pending.started_unix)?;
-    Ok(())
+    run_daemon(backend, &pending.request, pending.started_unix)
 }
 
 /// Run the daemon loop: take the lock, publish state, serve until `Stop`.
@@ -125,8 +134,9 @@ fn daemon_main_inner() -> Result<()> {
 /// 4. Snapshot the backend's [`WakeStatus`] once — the lock's identity does not
 ///    change over the daemon's lifetime, so a single `status()` call is both
 ///    correct and cheap.
-/// 5. Write `state.json` so `ow status` works without a live IPC, and remove
-///    `pending.json` (the hand-off file has done its job).
+/// 5. Write `state.json` so `ow status` works without a live IPC. (The
+///    per-invocation `pending.{pid}.json` hand-off was already consumed by
+///    [`daemon_main_inner`] before this function runs.)
 /// 6. Serve: [`platform::bind_and_serve`](crate::platform::bind_and_serve) with
 ///    a closure that owns the guard and status and answers `Ping`, `Status`,
 ///    and `Stop`.
@@ -184,9 +194,6 @@ pub fn run_daemon(
         request: req.clone(),
     };
     LockState::write(&paths, &state)?;
-    // pending.json has served its purpose; its absence also signals to a
-    // retrying `ensure_started` that the daemon came up.
-    let _ = LockState::remove_pending(&paths);
 
     // 4. Serve. The guard is moved into the closure so it lives exactly as
     //    long as the serve loop; the captured `status` is cheaply cloned per
@@ -252,11 +259,15 @@ pub fn ensure_started(req: &WakeRequest, started_unix: u64) -> Result<WakeStatus
     // this run does not get poisoned by a stale reason before the new child
     // has a chance to clear it itself.
     let _ = clear_startup_error(&paths);
-    write_pending(&paths, req, started_unix)?;
+    // Per-invocation hand-off file so two concurrent `ow on` invocations can
+    // never overwrite each other's request: each CLI writes its own
+    // `pending.{pid}.json` and passes the path to the daemon it spawns.
+    let pending_path = pending_request_path(&paths);
+    write_pending(&pending_path, req, started_unix)?;
 
     // Spawn the detached daemon. Failures here are fatal — without a daemon
     // there is no way to hold the lock.
-    spawn_detached_daemon()?;
+    spawn_detached_daemon(&pending_path)?;
 
     // Poll until the daemon publishes state and answers pings, or we time out.
     let deadline = Instant::now() + STARTUP_POLL_TIMEOUT;
@@ -277,7 +288,7 @@ pub fn ensure_started(req: &WakeRequest, started_unix: u64) -> Result<WakeStatus
         // (e.g. the OS refused the inhibitor), surface that real reason now
         // instead of waiting out the full poll timeout.
         if let Some(reason) = read_and_clear_startup_error(&paths) {
-            let _ = LockState::remove_pending(&paths);
+            let _ = std::fs::remove_file(&pending_path);
             return Err(OxiwakeError::Other(format!(
                 "oxiwake daemon failed to start: {reason}"
             )));
@@ -286,7 +297,7 @@ pub fn ensure_started(req: &WakeRequest, started_unix: u64) -> Result<WakeStatus
         if Instant::now() >= deadline {
             // Clean up the now-stale hand-off file so the next attempt starts
             // clean rather than reusing a request the daemon never consumed.
-            let _ = LockState::remove_pending(&paths);
+            let _ = std::fs::remove_file(&pending_path);
             return Err(OxiwakeError::Other(format!(
                 "spawned oxiwake daemon but it did not come up within {:?} \
                  (check `ow doctor` and that a backend can acquire the lock)",
@@ -349,27 +360,38 @@ pub fn ipc_request(msg: ClientMsg) -> Result<DaemonReply> {
 // pending.json + process spawn helpers
 // ---------------------------------------------------------------------------
 
+/// The per-invocation pending-request hand-off path: `pending.{pid}.json`.
+///
+/// Keyed on this process's pid so two concurrent `ow on` invocations each get
+/// their own file and cannot overwrite each other's request. The CLI writes
+/// this path and passes it to the daemon it spawns.
+fn pending_request_path(paths: &Paths) -> std::path::PathBuf {
+    paths
+        .dir
+        .join(format!("pending.{}.json", std::process::id()))
+}
+
 /// Write the request hand-off file for the about-to-be-spawned daemon.
 ///
 /// Serialized as `{"request": <WakeRequest>, "started_unix": <u64>}`. Written
 /// atomically via [`LockState`]'s temp-file-and-rename helper to avoid the
 /// child ever reading a half-written file.
-fn write_pending(paths: &Paths, req: &WakeRequest, started_unix: u64) -> Result<()> {
+fn write_pending(path: &std::path::Path, req: &WakeRequest, started_unix: u64) -> Result<()> {
     let pending = PendingRequest {
         request: req.clone(),
         started_unix,
     };
     let bytes = serde_json::to_vec_pretty(&pending)
         .map_err(|e| OxiwakeError::State(format!("could not serialize pending request: {e}")))?;
-    atomic_write(&paths.pending, &bytes)
+    atomic_write(path, &bytes)
 }
 
 /// Read the request hand-off file. `Ok(None)` if it is absent.
-fn read_pending(paths: &Paths) -> Result<Option<PendingRequest>> {
-    match std::fs::read(&paths.pending) {
+fn read_pending(path: &std::path::Path) -> Result<Option<PendingRequest>> {
+    match std::fs::read(path) {
         Ok(bytes) => {
             let value = serde_json::from_slice::<PendingRequest>(&bytes).map_err(|e| {
-                OxiwakeError::State(format!("could not parse {}: {e}", paths.pending.display()))
+                OxiwakeError::State(format!("could not parse {}: {e}", path.display()))
             })?;
             Ok(Some(value))
         }
@@ -378,7 +400,8 @@ fn read_pending(paths: &Paths) -> Result<Option<PendingRequest>> {
     }
 }
 
-/// Spawn `ow __daemon` as a detached background process.
+/// Spawn `ow __daemon <pending_path>` as a detached background process, where
+/// `pending_path` is the per-invocation request hand-off file the CLI wrote.
 ///
 /// All standard streams are wired to `Null` so the daemon never holds the
 /// CLI's terminal hostage. On Linux a `pre_exec` hook calls `setsid` so the
@@ -387,12 +410,15 @@ fn read_pending(paths: &Paths) -> Result<Option<PendingRequest>> {
 /// On Windows the child is created `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 /// | CREATE_NO_WINDOW` so it owns no console and survives the CLI's console
 /// closing (a plain `spawn` would otherwise be killed with the console group).
-fn spawn_detached_daemon() -> Result<()> {
+fn spawn_detached_daemon(pending_path: &std::path::Path) -> Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| OxiwakeError::Other(format!("could not resolve current exe: {e}")))?;
 
     let mut cmd = Command::new(exe);
     cmd.arg(DAEMON_SUBCOMMAND);
+    // The per-invocation hand-off path so the daemon reads THIS CLI's request,
+    // not a concurrently-started sibling's.
+    cmd.arg(pending_path);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
@@ -474,27 +500,6 @@ fn atomic_write(dest: &std::path::Path, bytes: &[u8]) -> Result<()> {
         return Err(OxiwakeError::from(e));
     }
     Ok(())
-}
-
-impl LockState {
-    /// Remove the `pending.json` hand-off file. `Ok(())` if it was absent.
-    ///
-    /// Lives next to [`LockState::remove`] for discoverability even though
-    /// `pending.json` is not a `LockState`; it shares the same
-    /// ignore-if-absent discipline.
-    pub fn remove_pending(paths: &Paths) -> Result<()> {
-        remove_pending(paths)
-    }
-}
-
-/// Free-function core of [`LockState::remove_pending`]; delete `pending.json`
-/// if present, `Ok(())` otherwise.
-fn remove_pending(paths: &Paths) -> Result<()> {
-    match std::fs::remove_file(&paths.pending) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(OxiwakeError::from(e)),
-    }
 }
 
 // ---------------------------------------------------------------------------

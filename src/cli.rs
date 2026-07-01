@@ -19,6 +19,7 @@
 //!   appears in `--help`, matching the contract in `daemon::DAEMON_SUBCOMMAND`.
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use crate::model::{WakeRequest, WakeTarget};
 
@@ -101,10 +102,15 @@ pub enum Commands {
 
     /// Hidden internal entry point: run the daemon process.
     ///
-    /// Spawned (detached) by [`daemon::ensure_started`](crate::daemon). Never
+    /// Spawned (detached) by [`daemon::ensure_started`](crate::daemon) as
+    /// `ow __daemon <pending.{pid}.json>`, where the sole argument is the
+    /// per-invocation request hand-off path the spawning CLI wrote. Never
     /// invoked directly by a user, and hidden from `--help`.
     #[command(name = "__daemon", hide = true)]
-    Daemon,
+    Daemon {
+        /// Per-invocation pending-request hand-off path written by the CLI.
+        pending: PathBuf,
+    },
 }
 
 /// Flags that can shape a [`WakeRequest`] — shared by `on` and `toggle`.
