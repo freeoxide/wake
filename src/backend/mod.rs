@@ -52,7 +52,31 @@ pub mod x11;
 pub fn supported_backends() -> Vec<Box<dyn WakeBackend>> {
     // The entries are individually feature-gated, so a `vec![]` literal does
     // not compose with `#[cfg]` — we build the list with conditional pushes.
+    // `mut` is itself gated: when no backend feature is enabled (e.g.
+    // `--no-default-features`) every push is cfg-ed out and an unconditional
+    // `mut` would trip clippy's `unused_mut`.
+    #[cfg(any(
+        all(target_os = "linux", feature = "linux-logind"),
+        all(target_os = "linux", feature = "linux-portal"),
+        all(target_os = "linux", feature = "linux-gnome"),
+        all(target_os = "linux", feature = "linux-kde"),
+        all(target_os = "linux", feature = "linux-screensaver"),
+        all(target_os = "linux", feature = "linux-x11"),
+        all(target_os = "linux", feature = "linux-wayland"),
+        windows
+    ))]
     let mut v: Vec<Box<dyn WakeBackend>> = Vec::new();
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "linux-logind"),
+        all(target_os = "linux", feature = "linux-portal"),
+        all(target_os = "linux", feature = "linux-gnome"),
+        all(target_os = "linux", feature = "linux-kde"),
+        all(target_os = "linux", feature = "linux-screensaver"),
+        all(target_os = "linux", feature = "linux-x11"),
+        all(target_os = "linux", feature = "linux-wayland"),
+        windows
+    )))]
+    let v: Vec<Box<dyn WakeBackend>> = Vec::new();
 
     #[cfg(all(target_os = "linux", feature = "linux-logind"))]
     v.push(Box::new(logind::LogindBackend::new()));
