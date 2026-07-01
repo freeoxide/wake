@@ -31,6 +31,29 @@ use crate::model::{DoctorReport, WakeBackend, WakeGuard, WakeMode, WakeStatus, W
 /// Stable backend identifier surfaced by [`X11Backend::name`] and `ow doctor`.
 const NAME: &str = "x11-screensaver";
 
+/// The `suspend` argument to pass to `XScreenSaverSuspend` for the two phases
+/// of an inhibit lifecycle. `Acquire` sends `1` (True: suspend the screensaver
+/// and DPMS timers); `Release` sends `0` (False: resume them). Extracted as a
+/// pure helper so the acquire/Drop argument values are unit-tested without
+/// needing a live X connection.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SuspendArg {
+    Acquire,
+    Release,
+}
+
+impl SuspendArg {
+    /// The raw `BOOL` value the X protocol expects: `1` to suspend, `0` to
+    /// release. (X11 `BOOL` is an `i32`; x11rb's `screensaver_suspend` takes a
+    /// `u32`, and `1`/`0` are the only meaningful values per xscreensaver(3).)
+    fn value(self) -> u32 {
+        match self {
+            SuspendArg::Acquire => 1,
+            SuspendArg::Release => 0,
+        }
+    }
+}
+
 /// X11 screensaver/DPMS backend.
 ///
 /// Constructing this value performs **no I/O**; it only records intent. The X
@@ -79,14 +102,32 @@ impl X11Backend {
                 reason: format!("X query-extension failed ({})", e),
             })?;
 
-        if present.is_none() {
-            return Err(OxiwakeError::BackendUnavailable {
-                backend: NAME,
-                reason: "X server does not advertise the MIT-SCREEN-SAVER extension".to_string(),
-            });
-        }
+        // The presence check itself is pure: given whether the server
+        // advertises the extension, either yield `Ok` or the precise "extension
+        // not advertised" error. Extracted so the mapping is unit-testable
+        // without an X connection. Collapse the rich extension metadata to a
+        // bare present/absent signal — only presence matters here.
+        let present_signal = present.map(|_| ());
+        require_extension(present_signal).map(|()| (conn, screen))
+    }
+}
 
-        Ok((conn, screen))
+/// Map the MIT-SCREEN-SAVER extension's presence to a `Result`. Returns
+/// `Ok(())` when the server advertises the extension, or a
+/// [`OxiwakeError::BackendUnavailable`] naming the missing extension
+/// otherwise. The X connection is the caller's concern; this helper only
+/// encodes the pure present -> error decision so it can be tested in
+/// isolation.
+fn require_extension(present: Option<()>) -> Result<()> {
+    // The caller passes `Some(())` if extension_information returned a
+    // present reply (we discard the inner metadata — only presence matters)
+    // and `None` if the extension was absent.
+    match present {
+        Some(()) => Ok(()),
+        None => Err(OxiwakeError::BackendUnavailable {
+            backend: NAME,
+            reason: "X server does not advertise the MIT-SCREEN-SAVER extension".to_string(),
+        }),
     }
 }
 
@@ -117,7 +158,7 @@ impl WakeBackend for X11Backend {
         // check() to surface any X error synchronously so a failed inhibit is
         // reported as AcquireFailed instead of silently lost.
         let cookie = conn
-            .screensaver_suspend(1)
+            .screensaver_suspend(SuspendArg::Acquire.value())
             .map_err(|e| OxiwakeError::AcquireFailed {
                 backend: NAME,
                 reason: format!("screensaver_suspend request failed ({})", e),
@@ -249,11 +290,103 @@ impl Drop for X11Guard {
             // drop: a failing release is logged but cannot be surfaced as an
             // error from Drop. We still flush so the release actually reaches
             // the server before the socket closes.
-            if let Ok(cookie) = conn.screensaver_suspend(0) {
+            if let Ok(cookie) = conn.screensaver_suspend(SuspendArg::Release.value()) {
                 let _ = cookie.check();
             }
             let _ = conn.flush();
             // `conn` drops here, closing the X socket.
+        }
+    }
+}
+
+// Unit tests for the pure logic. The whole module is feature-gated above
+// (`#![cfg(all(target_os = "linux", feature = "linux-x11"))]`), so the test
+// module is gated the same way AND with `test` — it only compiles when the
+// `linux-x11` feature is on during a test build, and never opens a real X
+// connection (none of the helpers below do I/O).
+#[cfg(all(test, feature = "linux-x11"))]
+mod tests {
+    use super::*;
+    use crate::model::{WakeMode, WakeTarget};
+
+    #[test]
+    fn backend_name_is_stable() {
+        // `ow doctor` and state.json rely on this string being stable.
+        assert_eq!(NAME, "x11-screensaver");
+    }
+
+    #[test]
+    fn new_and_supported_do_not_connect() {
+        // `new()` records intent only; it must not touch the X server.
+        let b = X11Backend::new();
+        assert_eq!(b.name(), NAME);
+        assert!(b.supported());
+        assert_eq!(X11Backend::default().name(), NAME);
+    }
+
+    #[test]
+    fn status_reports_display_and_idle_only() {
+        // status() is a static report: display/idle scope, Block mode, no I/O.
+        let s = X11Backend::new().status().expect("status");
+        assert_eq!(s.backend, NAME);
+        assert_eq!(s.mode, WakeMode::Block);
+        assert!(s.display);
+        assert!(s.targets.contains(&WakeTarget::Idle));
+        assert!(s.targets.contains(&WakeTarget::Display));
+        // X11 suspend is display/idle-level only — it must not claim to block
+        // system sleep or lid-close (setup.md section 6 caveat).
+        assert!(!s.targets.contains(&WakeTarget::SystemSleep));
+        assert!(!s.targets.contains(&WakeTarget::LidSwitch));
+    }
+
+    #[test]
+    fn guard_backend_matches_name() {
+        // The guard's backend tag must agree with the backend's own name so
+        // IPC/state can correlate them. We cannot build a RustConnection (and
+        // thus an X11Guard) without a live X server, so the WakeGuard::backend
+        // impl just returns NAME directly — assert the constant it returns.
+        assert_eq!(NAME, "x11-screensaver");
+    }
+
+    #[test]
+    fn suspend_arg_acquire_is_one() {
+        // XScreenSaverSuspend(True) -> 1. The acquire path must pass 1.
+        assert_eq!(SuspendArg::Acquire.value(), 1);
+    }
+
+    #[test]
+    fn suspend_arg_release_is_zero() {
+        // XScreenSaverSuspend(False) -> 0. The Drop path must pass 0.
+        assert_eq!(SuspendArg::Release.value(), 0);
+    }
+
+    #[test]
+    fn suspend_args_are_distinct() {
+        // Acquire and Release must not alias — swapping them would invert the
+        // inhibit (hold on Drop, release on acquire). Lock that invariant.
+        assert_ne!(SuspendArg::Acquire.value(), SuspendArg::Release.value());
+    }
+
+    #[test]
+    fn require_extension_ok_when_present() {
+        // A server that advertises the extension yields Ok (no error).
+        assert!(require_extension(Some(())).is_ok());
+    }
+
+    #[test]
+    fn require_extension_err_when_absent() {
+        // A server that does NOT advertise MIT-SCREEN-SAVER must surface a
+        // BackendUnavailable naming the extension, so `ow doctor` is honest.
+        match require_extension(None) {
+            Err(OxiwakeError::BackendUnavailable { backend, reason }) => {
+                assert_eq!(backend, NAME);
+                assert!(
+                    reason.contains("MIT-SCREEN-SAVER"),
+                    "reason must name the missing extension, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected BackendUnavailable, got {other:?}"),
+            Ok(()) => panic!("absent extension must be an error"),
         }
     }
 }
