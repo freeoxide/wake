@@ -380,16 +380,12 @@ fn spawn_detached_daemon() -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         // Detach into a new session so the daemon outlives the CLI and is not
-        // killed when the CLI's controlling terminal closes. If `setsid`
-        // fails the spawn will surface that as an error via the pre_exec
-        // hook's non-zero status.
+        // killed when the CLI's controlling terminal closes. If `setsid` fails
+        // the closure returns the `io::Error`, which aborts the exec attempt and
+        // surfaces as an error from `Command::spawn` (a failed `pre_exec` hook
+        // makes `spawn` return the error rather than silently running undetached).
         unsafe {
-            cmd.pre_exec(|| {
-                // Best-effort setsid; a failure here aborts the exec attempt
-                // and surfaces as an error from `Command::spawn`.
-                let _ = libc_setsid();
-                Ok(())
-            });
+            cmd.pre_exec(|| libc_setsid());
         }
     }
 
