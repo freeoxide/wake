@@ -18,6 +18,10 @@
 //!   [`DaemonReply`](crate::ipc::DaemonReply), writes the reply, and — after
 //!   dispatching a [`Stop`](crate::ipc::ClientMsg::Stop) — breaks the loop and
 //!   returns `Ok(())`.
+//! - [`acquire_singleton_lock`] / [`SingletonLock`] — an atomic, cross-process
+//!   mutex on a lock file (`flock` on Linux, `LockFileEx` on Windows) that the
+//!   daemon holds for its whole lifetime so two racing `ow on` invocations can
+//!   never both reach OS-lock acquisition.
 //!
 //! Only one platform module is compiled per build: the `cfg` declarations
 //! below pull in `linux` on `target_os = "linux"` and `windows` on `windows`,
@@ -28,12 +32,12 @@
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{bind_and_serve, connect};
+pub use linux::{acquire_singleton_lock, bind_and_serve, connect, SingletonLock};
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{bind_and_serve, connect};
+pub use windows::{acquire_singleton_lock, bind_and_serve, connect, SingletonLock};
 
 /// A bidirectional byte stream connecting a client and the daemon.
 ///

@@ -1,9 +1,9 @@
 //! Filesystem locations for Oxiwake's runtime state.
 //!
 //! Oxiwake keeps a small amount of per-user runtime state (the active lock
-//! snapshot, a pending-request hand-off file, and the IPC socket) in a single
-//! private directory. This module resolves that directory and the well-known
-//! files inside it.
+//! snapshot, a pending-request hand-off file, the IPC socket, and a singleton
+//! lock file that gates daemon startup) in a single private directory. This
+//! module resolves that directory and the well-known files inside it.
 //!
 //! Locations (see `docs/setup.md`):
 //!
@@ -38,6 +38,12 @@ pub struct Paths {
     /// `dir/pending.json` — the request hand-off file the CLI writes so the
     /// freshly-spawned daemon knows what lock to take.
     pub pending: PathBuf,
+    /// `dir/oxiwake.lock` — the singleton advisory lock (flock on Linux,
+    /// `LockFileEx` on Windows) the daemon holds for its entire lifetime. It is
+    /// the atomic mutex that ensures two racing `ow on` invocations can never
+    /// both reach OS-lock acquisition; it auto-releases when the daemon's fd /
+    /// handle closes (including on crash).
+    pub lock: PathBuf,
 }
 
 impl Paths {
@@ -82,12 +88,14 @@ impl Paths {
         // The IPC socket name is platform-neutral; on Linux this is a Unix
         // domain socket.
         let socket = dir.join("oxiwake.sock");
+        let lock = dir.join("oxiwake.lock");
 
         Ok(Paths {
             dir,
             state,
             socket,
             pending,
+            lock,
         })
     }
 

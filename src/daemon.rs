@@ -114,18 +114,26 @@ fn daemon_main_inner() -> Result<()> {
 ///
 /// Steps:
 ///
-/// 1. Pick a backend for `req` and acquire its guard (taking the OS lock).
-/// 2. Snapshot the backend's [`WakeStatus`] once — the lock's identity does
-///    not change over the daemon's lifetime, so a single `status()` call is
-///    both correct and cheap.
-/// 3. Write `state.json` so `ow status` works without a live IPC, and remove
+/// 1. Decline fast if a `Ping` finds a daemon already serving.
+/// 2. Claim the singleton file lock ([`platform::acquire_singleton_lock`]) —
+///    the atomic mutex guaranteeing only one daemon ever reaches step 3. A
+///    racing second `ow on` declines here, before it can take a second OS lock
+///    or clobber `state.json`. (The backend is injected by the caller so this
+///    lifecycle is unit-testable with a mock; the real entry point does the
+///    [`backend::pick`].)
+/// 3. Acquire the backend's guard (taking the OS wake lock).
+/// 4. Snapshot the backend's [`WakeStatus`] once — the lock's identity does not
+///    change over the daemon's lifetime, so a single `status()` call is both
+///    correct and cheap.
+/// 5. Write `state.json` so `ow status` works without a live IPC, and remove
 ///    `pending.json` (the hand-off file has done its job).
-/// 4. Serve: [`platform::bind_and_serve`](crate::platform::bind_and_serve) with
+/// 6. Serve: [`platform::bind_and_serve`](crate::platform::bind_and_serve) with
 ///    a closure that owns the guard and status and answers `Ping`, `Status`,
 ///    and `Stop`.
-/// 5. On return (a `Stop` was dispatched, or the serve loop failed), remove
-///    `state.json` so a subsequent `ow status` does not report a stale lock —
-///    then the guard drops, releasing the OS lock.
+/// 7. On return (a `Stop` was dispatched, or the serve loop failed) the guard
+///    has already been released (it dropped inside `bind_and_serve`'s return);
+///    remove `state.json` so a subsequent `ow status` does not report a stale
+///    lock. The singleton lock drops last, at function return.
 pub fn run_daemon(
     backend: Box<dyn WakeBackend>,
     req: &WakeRequest,
@@ -133,12 +141,11 @@ pub fn run_daemon(
 ) -> Result<()> {
     let paths = Paths::resolve()?;
 
-    // 0. Defense in depth against a double lock: if a daemon is *already*
-    //    serving on this socket, do not take a second inhibitor. A second lock
-    //    is pointless, and combined with a bind race it could orphan the first
-    //    daemon's lock (it would keep holding an inhibitor on an unreachable
-    //    socket). `ensure_started` should have caught this on the client side;
-    //    we re-check here so a racing double `ow on` can never wedge things.
+    // 0. Fast-path decline: if a daemon is *already* serving on this socket,
+    //    do not take a second inhibitor. This Ping is a cheap optimization —
+    //    the authoritative mutex is the singleton lock taken next, which is
+    //    what actually closes the racing-double-`ow on` window (a Ping is
+    //    check-then-act; the file lock is atomic).
     if let Ok(reply) = ipc_request(ClientMsg::Ping) {
         if reply.ok {
             // Another daemon is live. Decline to serve; the guard we were
@@ -146,6 +153,18 @@ pub fn run_daemon(
             return Ok(());
         }
     }
+
+    // 0b. The atomic singleton mutex. Two racing `ow on` invocations can both
+    //     pass the Ping above (neither daemon has bound yet); only one can hold
+    //     the singleton file lock (flock on Linux, LockFileEx on Windows). The
+    //     loser declines here — BEFORE acquiring the OS wake lock or writing
+    //     state.json — so a racing double start can never take a second lock or
+    //     clobber the winner's state. Held for the daemon's whole lifetime and
+    //     auto-released on return (or crash).
+    let _singleton = match platform::acquire_singleton_lock(&paths)? {
+        Some(lock) => lock,
+        None => return Ok(()),
+    };
 
     // 1. Take the lock. `acquire` returns the RAII guard that owns the OS
     //    resource; keep it alive for the whole serve loop. (The backend is
@@ -182,10 +201,12 @@ pub fn run_daemon(
         }
     });
 
-    // 5. Tear down: clear state so a later `ow status` does not see a stale
-    //    lock. Best-effort — a failure here must not mask the real error from
-    //    the serve loop. The guard drops at the end of this function, after
-    //    state cleanup, releasing the OS resource last.
+    // 5. Tear down. The OS lock (guard) was already released: it was moved
+    //    into the serve closure and dropped when `bind_and_serve` returned. Now
+    //    clear state.json best-effort so a later `ow status` does not see a
+    //    stale lock — a failure here must not mask the real error from the
+    //    serve loop. The singleton lock (`_singleton`) is released last, when
+    //    it drops at function return.
     let _ = LockState::remove(&paths);
 
     serve_result?;

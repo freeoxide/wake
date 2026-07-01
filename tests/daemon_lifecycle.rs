@@ -14,7 +14,7 @@
 //!   7. `state.json` is removed on the way out so a later `ow status` is honest.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use oxiwake::daemon;
@@ -236,6 +236,87 @@ fn second_run_daemon_declines_when_one_is_already_serving() {
     assert!(daemon::ipc_request(ClientMsg::Stop).unwrap().ok);
     handle_a.join().unwrap().unwrap();
     assert!(st_a.released.load(Ordering::SeqCst), "A released on stop");
+
+    let _ = std::fs::remove_dir_all(&runtime);
+}
+
+#[test]
+fn concurrent_double_start_takes_exactly_one_lock() {
+    let _serialize = SERIALIZE.lock().unwrap();
+    // Regression for the racing-double-`ow on` defect that the singleton lock
+    // closes: if two `run_daemon` calls start SIMULTANEOUSLY (so neither is up
+    // when the other runs its pre-acquire Ping), the singleton file lock must
+    // still ensure exactly one of them acquires the OS lock. Before that lock
+    // this was a TOCTOU: both could acquire, clobbering state.json and leaving
+    // the winner with no state file.
+    let runtime = std::env::temp_dir().join(format!("oxiwake-test-4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runtime);
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::env::set_var("XDG_RUNTIME_DIR", &runtime);
+
+    let st_a = Arc::new(MockState::default());
+    let st_b = Arc::new(MockState::default());
+    let req = WakeRequest::default_linux();
+
+    // A barrier so both daemons enter run_daemon as simultaneously as possible,
+    // maximizing the chance both pass the pre-acquire Ping before either binds.
+    let barrier = Arc::new(Barrier::new(2));
+    let backend_a: Box<dyn WakeBackend> = Box::new(MockBackend {
+        st: Arc::clone(&st_a),
+    });
+    let backend_b: Box<dyn WakeBackend> = Box::new(MockBackend {
+        st: Arc::clone(&st_b),
+    });
+
+    let handle_a = {
+        let barrier = Arc::clone(&barrier);
+        let req = req.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            daemon::run_daemon(backend_a, &req, 1_700_000_000)
+        })
+    };
+    let handle_b = {
+        let barrier = Arc::clone(&barrier);
+        let req = req.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            daemon::run_daemon(backend_b, &req, 1_700_000_001)
+        })
+    };
+
+    // Exactly one daemon comes up and answers Ping.
+    let ping = poll_for(Duration::from_secs(5), || {
+        daemon::ipc_request(ClientMsg::Ping).ok()
+    })
+    .expect("neither daemon answered Ping — both declined?");
+    assert!(ping.ok);
+
+    // THE invariant this test exists for: exactly one of the two acquired the
+    // OS lock. (The winner acquires before it binds; the loser declined at the
+    // singleton lock before acquiring.)
+    let acquired_a = st_a.acquired.load(Ordering::SeqCst);
+    let acquired_b = st_b.acquired.load(Ordering::SeqCst);
+    assert!(
+        acquired_a ^ acquired_b,
+        "expected exactly one daemon to acquire the lock; got a={acquired_a} b={acquired_b}"
+    );
+
+    // Stop whichever daemon won; both threads must then return Ok (the winner
+    // served cleanly, the loser declined cleanly).
+    assert!(daemon::ipc_request(ClientMsg::Stop).unwrap().ok);
+    let result_a = handle_a.join().expect("A thread panicked");
+    let result_b = handle_b.join().expect("B thread panicked");
+    assert!(result_a.is_ok(), "A should return Ok: {:?}", result_a);
+    assert!(result_b.is_ok(), "B should return Ok: {:?}", result_b);
+
+    // The winner released its guard on stop; the loser never took one.
+    let released_a = st_a.released.load(Ordering::SeqCst);
+    let released_b = st_b.released.load(Ordering::SeqCst);
+    assert!(
+        released_a ^ released_b,
+        "expected exactly one guard to drop; got a={released_a} b={released_b}"
+    );
 
     let _ = std::fs::remove_dir_all(&runtime);
 }

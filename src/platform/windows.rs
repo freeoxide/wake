@@ -51,12 +51,12 @@ use std::ptr;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, FALSE, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, ERROR_LOCK_VIOLATION, GetLastError, DUPLICATE_SAME_ACCESS, FALSE,
+    HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX,
+    CreateFileW, LockFileEx, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED,
+    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, WaitNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
@@ -865,6 +865,92 @@ fn read_overlapped(
         return Err(io::Error::from_raw_os_error(code as i32));
     }
     Ok(transferred as usize)
+}
+
+// ---------------------------------------------------------------------------
+// Singleton lock — the atomic mutex that gates daemon startup
+// ---------------------------------------------------------------------------
+
+/// `LockFileEx` flags: an exclusive lock that fails immediately rather than
+/// blocking when another process already holds it.
+const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+
+/// An exclusive lock on the singleton lock file, held for the daemon's whole
+/// lifetime so two racing `ow on` invocations can never both take an OS wake
+/// lock. Dropping it closes the handle, which also releases the `LockFileEx`
+/// lock — and would on a crash, once the OS reaps the process's handles.
+pub struct SingletonLock {
+    handle: HANDLE,
+}
+
+// SAFETY: the lock-file handle is process-wide state, not thread-affine; the
+// daemon holds it on a single thread for its entire lifetime.
+unsafe impl Send for SingletonLock {}
+
+/// Atomically claim the singleton lock, or report that another daemon holds it.
+///
+/// Opens (creating if needed) `paths.lock` and takes an exclusive, failing-fast
+/// `LockFileEx` on byte 0:
+/// - `Ok(None)` — another process holds the lock (`ERROR_LOCK_VIOLATION`); the
+///   caller should decline to serve.
+/// - `Ok(Some(_))` — this process now owns the lock for its lifetime.
+/// - `Err(_)` — any other failure.
+pub fn acquire_singleton_lock(paths: &Paths) -> Result<Option<SingletonLock>> {
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+
+    // create + read + write. std's default share mode (READ|WRITE|DELETE) lets
+    // two processes both hold the file open while LockFileEx arbitrates between
+    // them, which is exactly the arbitration we want for a singleton daemon.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&paths.lock)?;
+    let handle = file.as_raw_handle();
+
+    // OVERLAPPED for LockFileEx: Offset/OffsetHigh select the region; lock byte
+    // 0. The rest of the struct is unused and zero-initialized (mirrors the
+    // existing overlapped usage in this file).
+    let mut overlapped: OVERLAPPED = unsafe { MaybeUninit::zeroed().assume_init() };
+    // SAFETY: `handle` is a valid file handle from a just-opened file;
+    // `overlapped` is a valid stack out-pointer. The locked region is byte 0.
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1, // nNumberOfBytesToLockLow — lock byte 0
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok != FALSE {
+        // Take ownership of the handle without closing it; the guard keeps the
+        // file (and its lock) open for the daemon's lifetime.
+        let raw = file.into_raw_handle();
+        Ok(Some(SingletonLock { handle: raw }))
+    } else {
+        let code = unsafe { GetLastError() };
+        if code == ERROR_LOCK_VIOLATION {
+            // Another daemon holds the singleton lock; decline to serve.
+            Ok(None)
+        } else {
+            Err(OxiwakeError::Io(io::Error::from_raw_os_error(code as i32)))
+        }
+    }
+}
+
+impl Drop for SingletonLock {
+    fn drop(&mut self) {
+        // Closing the handle releases any LockFileEx lock on it, so a separate
+        // UnlockFileEx is unnecessary (and would need a matching OVERLAPPED).
+        // Best-effort; there is nothing to propagate from a drop.
+        if !self.handle.is_null() {
+            // SAFETY: we solely own this handle and only close it here.
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

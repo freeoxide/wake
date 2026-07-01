@@ -220,6 +220,59 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Singleton lock — the atomic mutex that gates daemon startup
+// ---------------------------------------------------------------------------
+
+/// `flock(2)` operation flags, linked from the C library (glibc/musl/bionic all
+/// export `flock`) to avoid pulling in the `libc` crate — the same FFI approach
+/// used for `setsid` in [`crate::daemon`].
+const FLOCK_EXCLUSIVE: i32 = 2;
+const FLOCK_NONBLOCK: i32 = 4;
+
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+/// An exclusive advisory lock on the singleton lock file, held for the daemon's
+/// whole lifetime so two racing `ow on` invocations can never both take an OS
+/// wake lock. Dropping it closes the underlying fd, which releases the lock —
+/// also true if the daemon crashes, since the kernel reaps the fd.
+#[allow(dead_code)] // the File is held purely for its Drop (fd close releases flock)
+pub struct SingletonLock(std::fs::File);
+
+/// Atomically claim the singleton lock, or report that another daemon holds it.
+///
+/// Opens (creating if needed) `paths.lock` and takes a non-blocking exclusive
+/// `flock`:
+/// - `Ok(None)` — another process already holds the lock (`EWOULDBLOCK`); the
+///   caller should decline to serve.
+/// - `Ok(Some(_))` — this process now owns the lock for its lifetime.
+/// - `Err(_)` — any other I/O failure.
+pub fn acquire_singleton_lock(paths: &Paths) -> Result<Option<SingletonLock>> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&paths.lock)?;
+    // SAFETY: `fd` is a valid open file descriptor; flock is async-signal-safe
+    // and thread-safe. LOCK_EX | LOCK_NB fails immediately (rather than
+    // blocking) if the lock is held.
+    let rc = unsafe { flock(file.as_raw_fd(), FLOCK_EXCLUSIVE | FLOCK_NONBLOCK) };
+    if rc == 0 {
+        Ok(Some(SingletonLock(file)))
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            // Another daemon holds the singleton lock; decline to serve.
+            Ok(None)
+        } else {
+            Err(OxiwakeError::from(err))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -125,6 +125,7 @@ mod tests {
             state: dir.join("does-not-exist.json"),
             socket: dir.join("s.sock"),
             pending: dir.join("p.json"),
+            lock: dir.join("l.lock"),
             dir: dir.clone(),
         };
         assert!(LockState::read(&paths).expect("read").is_none());
@@ -141,6 +142,7 @@ mod tests {
             state: dir.join("state.json"),
             socket: dir.join("s.sock"),
             pending: dir.join("p.json"),
+            lock: dir.join("l.lock"),
             dir: dir.clone(),
         };
         let st = LockState {
@@ -168,6 +170,7 @@ mod tests {
             state: dir.join("state.json"),
             socket: dir.join("s.sock"),
             pending: dir.join("p.json"),
+            lock: dir.join("l.lock"),
             dir: dir.clone(),
         };
         std::fs::write(&paths.state, b"{ not json").unwrap();
