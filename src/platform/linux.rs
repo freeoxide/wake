@@ -255,6 +255,9 @@ pub fn acquire_singleton_lock(paths: &Paths) -> Result<Option<SingletonLock>> {
         .create(true)
         .read(true)
         .write(true)
+        // The lock file's *content* is irrelevant — only the flock on its fd
+        // matters — so never truncate it.
+        .truncate(false)
         .open(&paths.lock)?;
     // SAFETY: `fd` is a valid open file descriptor; flock is async-signal-safe
     // and thread-safe. LOCK_EX | LOCK_NB fails immediately (rather than

@@ -51,7 +51,7 @@ use std::ptr;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, ERROR_LOCK_VIOLATION, GetLastError, DUPLICATE_SAME_ACCESS, FALSE,
+    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_LOCK_VIOLATION, FALSE,
     HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -906,6 +906,9 @@ pub fn acquire_singleton_lock(paths: &Paths) -> Result<Option<SingletonLock>> {
         .create(true)
         .read(true)
         .write(true)
+        // The lock file's *content* is irrelevant — only the LockFileEx lock on
+        // its handle matters — so never truncate it.
+        .truncate(false)
         .open(&paths.lock)?;
     let handle = file.as_raw_handle();
 
