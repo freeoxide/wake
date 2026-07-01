@@ -202,33 +202,168 @@ fn collect_windows(out: &mut Vec<(String, String)>) {
     env_kv(out, "LOCALAPPDATA");
 }
 
-/// Report the Windows version via `GetVersionExW`.
+/// Report the Windows version by reading the registry.
 ///
-/// `GetVersionExW` may be subject to manifest-based compatibility shimming on
-/// Windows 8.1+, but it is the cheapest portable call available through
-/// `windows-sys` with the feature set the crate already pulls in. For a doctor
-/// probe the reported numbers are good enough.
+/// `GetVersionExW` is manifest-shimmed: without a compatibility manifest it
+/// caps the reported version at 6.2 (Windows 8) / 6.3 (8.1) on Windows 10+,
+/// which is exactly the dishonesty `doctor` exists to avoid. The registry is
+/// the truthful source — Windows writes its real version under
+/// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`. We read
+/// `CurrentMajorVersionNumber` and `CurrentMinorVersionNumber` (REG_DWORD),
+/// `CurrentBuild` (REG_SZ), and `UBR` (REG_DWORD, "Update Build Revision"),
+/// rendering `major.minor.build.ubr`.
+///
+/// Note this is the same data the Modern Standby caveat in [`power`] depends
+/// on being accurate: S0ix behavior varies across major releases, so reporting
+/// a capped 6.2 would mislead the user about their own platform.
 #[cfg(windows)]
 fn version(out: &mut Vec<(String, String)>) {
-    use windows_sys::core::BOOL;
-    use windows_sys::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY,
+    };
 
-    // SAFETY: `OSVERSIONINFOW` is zero-initialized with its correct
-    // `dwOSVersionInfoSize`; `GetVersionExW` only writes into the struct.
-    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
-    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
-    let ok: BOOL = unsafe { GetVersionExW(&mut info) };
-    if ok != 0 {
-        out.push((
-            "Windows".to_string(),
-            format!(
-                "{}.{}.{}",
-                info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
-            ),
-        ));
-    } else {
+    // Open the native view of the registry from either a 32- or 64-bit process
+    // so we always read the real (64-bit) key. KEY_READ already grants query
+    // access; KEY_WOW64_64KEY forces the 64-bit view.
+    let subkey = wide_z("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: `subkey` is a NUL-terminated wide string valid for the call;
+    // `key` is an uninitialized out-pointer RegOpenKeyExW writes to on success.
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            0,
+            KEY_READ | KEY_WOW64_64KEY,
+            &mut key,
+        )
+    };
+    if status != ERROR_SUCCESS {
         out.push(("Windows".to_string(), "version unavailable".to_string()));
+        return;
     }
+
+    // Always close the key, even if the value queries below fail.
+    let major = query_u32(key, "CurrentMajorVersionNumber");
+    let minor = query_u32(key, "CurrentMinorVersionNumber");
+    let build = query_string(key, "CurrentBuild");
+    let ubr = query_u32(key, "UBR");
+
+    // SAFETY: `key` was successfully opened above; RegCloseKey is the matching
+    // release. Safe to call unconditionally on an open handle.
+    unsafe { RegCloseKey(key) };
+
+    // Render whatever we managed to read; the REG_DWORD fields are the version,
+    // UBR refines build precision, and CurrentBuild is the kernel build string.
+    let rendered = match (major, minor, build) {
+        (Some(maj), Some(min), Some(bld)) => {
+            let base = format!("{}.{}.{}", maj, min, bld);
+            match ubr {
+                Some(u) => format!("{}.{}", base, u),
+                None => base,
+            }
+        }
+        _ => "version unavailable".to_string(),
+    };
+    out.push(("Windows".to_string(), rendered));
+}
+
+/// Query a `REG_DWORD` value from `key`, returning its `u32` value on success.
+///
+/// `name` is ASCII; it is widened to UTF-16 + NUL on each call (cheap for a
+/// handful of doctor probes). Returns `None` on any registry error, on a type
+/// mismatch (the value is not a DWORD), or on the wrong data size.
+#[cfg(windows)]
+fn query_u32(key: windows_sys::Win32::System::Registry::HKEY, name: &str) -> Option<u32> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegQueryValueExW, REG_DWORD, REG_VALUE_TYPE};
+
+    let name_w = wide_z(name);
+    let mut value_type: REG_VALUE_TYPE = 0;
+    let mut data: u32 = 0;
+    let mut len: u32 = std::mem::size_of::<u32>() as u32;
+    // SAFETY: `key` is an open registry handle; `name_w` is NUL-terminated;
+    // `data` and `len` describe a 4-byte buffer exactly the size of a DWORD.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            &mut data as *mut u32 as *mut u8,
+            &mut len,
+        )
+    };
+    if status != ERROR_SUCCESS || value_type != REG_DWORD || len != 4 {
+        return None;
+    }
+    Some(data)
+}
+
+/// Query a `REG_SZ` value from `key`, returning it as a Rust `String`.
+///
+/// Returns `None` on any registry error, on a type mismatch (the value is not a
+/// string), or if the stored bytes are not valid UTF-16.
+#[cfg(windows)]
+fn query_string(key: windows_sys::Win32::System::Registry::HKEY, name: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegQueryValueExW, REG_SZ, REG_VALUE_TYPE};
+
+    let name_w = wide_z(name);
+    let mut value_type: REG_VALUE_TYPE = 0;
+    let mut len: u32 = 0;
+    // First pass: discover the required buffer size (data pointer is NULL).
+    // SAFETY: `key` is an open handle; querying with a NULL data pointer and a
+    // zero length is the documented way to read the size.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    if status != ERROR_SUCCESS || value_type != REG_SZ {
+        return None;
+    }
+    if len == 0 {
+        return Some(String::new());
+    }
+
+    // `len` is in bytes; allocate a u16 buffer of that many bytes. REG_SZ values
+    // may or may not be NUL-terminated; we strip a trailing NUL if present.
+    let mut buf = vec![0u16; (len as usize) / 2];
+    // SAFETY: same query, now with a buffer sized to the reported length.
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            std::ptr::null(),
+            &mut value_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut len,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    // Strip a single trailing NUL if REG_SZ included one.
+    if buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf16(&buf).ok()
+}
+
+/// Encode an ASCII string as a NUL-terminated UTF-16 vector for the registry
+/// APIs (which take `PCWSTR` = `*const u16`).
+#[cfg(windows)]
+fn wide_z(s: &str) -> Vec<u16> {
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    v.push(0);
+    v
 }
 
 /// Report the power source via `GetSystemPowerStatus`.

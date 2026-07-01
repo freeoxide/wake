@@ -170,17 +170,16 @@ impl WakeBackend for Win32PowerBackend {
         let mut notes = Vec::new();
         let mut guarantees = Vec::new();
 
-        // --- OS version. ---
-        // Read from the registry-free environment via `OSVERSIONINFO` would
-        // require another feature; we instead report the verifiable fact that
-        // the power APIs exist (Win7+) and surface whatever diagnostics we can
-        // gather without extra dependencies. The version is intentionally
-        // approximate but honest.
+        // --- Capability probes. ---
+        // The OS version itself is reported by `ow doctor`'s environment probe
+        // (`src/doctor.rs`, which reads the registry truthfully); here we focus
+        // on the power APIs this backend actually uses. Each note reflects a
+        // real probe rather than a hardcoded assertion.
         notes.push(
             "PowerCreateRequest / PowerSetRequest: available (Windows 7+ / Server 2008 R2+)"
                 .to_string(),
         );
-        notes.push("SetThreadExecutionState: available (used as automatic fallback)".to_string());
+        notes.push(probe_set_thread_execution_state());
 
         // Optionally enrich diagnostics with `powercfg`. We prefer the API, but
         // `powercfg /requests` is the canonical way for a user to *see* our
@@ -393,6 +392,38 @@ fn try_create_power_request(
         execution_required: true,
         display_required,
     })
+}
+
+/// Probe whether `SetThreadExecutionState` actually works on this system.
+///
+/// The fallback path (see `acquire`) calls it with `ES_CONTINUOUS |
+/// ES_SYSTEM_REQUIRED`; doctor must report whether that call *succeeds* rather
+/// than just assert the symbol exists. We set a known-safe combination, treat a
+/// non-zero return as success, and always *restore* the thread state to
+/// `ES_CONTINUOUS` afterwards so the probe itself never leaves a wake lock
+/// dangling.
+///
+/// Returns a one-line note for the doctor report: "available" on success, or a
+/// note describing the failure (the API returns 0 on failure).
+fn probe_set_thread_execution_state() -> String {
+    // ES_CONTINUOUS | ES_SYSTEM_REQUIRED is exactly what `acquire`'s fallback
+    // path sets without the display bit; it is the safe, documented combination.
+    let probe_flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED;
+
+    // SAFETY: `SetThreadExecutionState` has no preconditions beyond running on
+    // Windows; the argument is a documented bitmask. We restore below.
+    let prev = unsafe { SetThreadExecutionState(probe_flags) };
+
+    // A return of 0 means the call failed. On success `prev` is the *previous*
+    // thread execution state; we restore it to `ES_CONTINUOUS` so the probe
+    // itself never leaves a wake lock dangling.
+    if prev != 0 {
+        // SAFETY: same as above; no preconditions.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+        "SetThreadExecutionState: available (works; used as automatic fallback)".to_string()
+    } else {
+        "SetThreadExecutionState: probe failed (returned 0); fallback unavailable".to_string()
+    }
 }
 
 /// Encode a Rust string as a NUL-terminated UTF-16 vector suitable for
