@@ -12,9 +12,9 @@ For **Oxiwake**, do **not** think in terms of "distro support." Think in terms o
 Linux:
   1. systemd-logind inhibitor     ← main backend
   2. XDG Desktop Portal inhibit   ← desktop/session backend
-  3. org.freedesktop.ScreenSaver  ← idle-only fallback
-  4. GNOME SessionManager         ← GNOME-specific fallback
-  5. KDE PowerDevil / Solid       ← KDE-specific fallback
+  3. GNOME SessionManager         ← GNOME-specific fallback
+  4. KDE PowerDevil / Solid       ← KDE-specific fallback
+  5. org.freedesktop.ScreenSaver  ← idle-only fallback
   6. X11 XScreenSaver / DPMS      ← old X11 fallback
   7. Wayland idle-inhibit         ← only useful if you have a surface
 
@@ -582,6 +582,8 @@ logind-zbus = { version = "5", optional = true }
 
 Current latest (as of mid-2026): `zbus` **5.16.0**, `ashpd` **0.13.12**, `logind-zbus` **5.3.2**.
 
+> **Implementation note.** The recommendation above lists `ashpd` (portal) and `logind-zbus` (logind) as convenience wrappers, but the actual Oxiwake implementation does **not** use either — it hand-rolls every D-Bus backend (logind, portal, GNOME, KDE, ScreenSaver) directly on raw `zbus`. This is deliberate: the whole stack is fully synchronous (no async runtime, no `.await`, no extra deps), and `zbus`'s blocking API is enough to drive each interface by hand. So in practice the only Linux D-Bus dependency that ships is `zbus` itself; `ashpd` and `logind-zbus` stay listed here as the originally-recommended, but unused, options.
+
 Optional (kept behind feature flags):
 
 ```toml
@@ -719,10 +721,16 @@ State location:
 
 ```text
 Linux:   $XDG_RUNTIME_DIR/oxiwake/state.json
+         $XDG_RUNTIME_DIR/oxiwake/pending.{pid}.json   (per-invocation)
+         $XDG_RUNTIME_DIR/oxiwake/oxiwake.lock          (singleton mutex)
 Windows: %LOCALAPPDATA%\Freeoxide\Oxiwake\state.json
+         %LOCALAPPDATA%\Freeoxide\Oxiwake\pending.{pid}.json   (per-invocation)
+         %LOCALAPPDATA%\Freeoxide\Oxiwake\oxiwake.lock          (singleton mutex)
 ```
 
-`$XDG_RUNTIME_DIR` (typically `/run/user/$UID`, a tmpfs created by `pam_systemd` at login, mode 0700) is the conventional base for user-specific non-essential runtime files and sockets, but it has no guaranteed default — the code should fall back or fail clearly when unset. Since `state.json` lives in a tmpfs it is wiped on logout/reboot, which is fine for transient lock state but the design must not rely on it persisting across reboots. On Windows, prefer resolving `%LOCALAPPDATA%` via `SHGetKnownFolderPath(FOLDERID_LocalAppData)` / the KnownFolders API rather than reading the raw env var, since the env var can be absent or mis-set.
+`state.json` is the persistent lock snapshot the daemon writes once the guard is live (so `ow status` works without a live IPC) and removes on the way out. `pending.{pid}.json` is the **transient, per-invocation request hand-off** between the CLI and the freshly-spawned daemon: keyed on the CLI's own pid so two concurrent `ow on` invocations never overwrite each other's request, the CLI writes it (`{"request": …, "started_unix": …}`) and passes its path to `ow __daemon`, which reads it back on startup to recover the request and timestamp and then deletes it. `ow on` polls for daemon liveness via `state.json` plus an IPC `Ping`, not via this file, so it should never linger on success. `oxiwake.lock` is the singleton advisory lock (`flock` on Linux, `LockFileEx` on Windows) the daemon holds for its entire lifetime: it is the atomic mutex that guarantees two racing `ow on` invocations can never both reach OS-lock acquisition, and it auto-releases when the daemon's fd/handle closes (including on crash).
+
+`$XDG_RUNTIME_DIR` (typically `/run/user/$UID`, a tmpfs created by `pam_systemd` at login, mode 0700) is the conventional base for user-specific non-essential runtime files and sockets, but it has no guaranteed default — the code should fall back or fail clearly when unset. Since `state.json`, `pending.{pid}.json`, and `oxiwake.lock` all live in a tmpfs they are wiped on logout/reboot, which is fine for transient lock state but the design must not rely on it persisting across reboots. On Windows, prefer resolving `%LOCALAPPDATA%` via `SHGetKnownFolderPath(FOLDERID_LocalAppData)` / the KnownFolders API rather than reading the raw env var, since the env var can be absent or mis-set.
 
 IPC:
 
