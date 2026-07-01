@@ -1,0 +1,71 @@
+[package]
+name = "oxiwake"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Keep your machine awake where the OS allows it — and tell you when it cannot."
+license = "MIT"
+repository = "https://github.com/freeoxide/oxiwake"
+keywords = ["caffeinate", "wake-lock", "systemd", "power", "keep-awake"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "oxiwake"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ow"
+path = "src/main.rs"
+
+# Feature model is "backend support", mirroring setup.md. D-Bus backends all
+# ride on zbus; X11/Wayland are opt-in because they pull heavier native deps.
+[features]
+default = ["linux-logind", "linux-portal", "linux-screensaver", "linux-gnome", "linux-kde"]
+linux-logind      = ["dep:zbus"]
+linux-portal      = ["dep:zbus"]
+linux-screensaver = ["dep:zbus"]
+linux-gnome       = ["dep:zbus"]
+linux-kde         = ["dep:zbus"]
+linux-x11         = ["dep:x11rb"]
+linux-wayland     = ["dep:wayland-client", "dep:wayland-protocols"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Linux-only native deps. zbus carries every D-Bus backend (logind, portal,
+# ScreenSaver, GNOME SessionManager, KDE PowerDevil). Optional + feature-gated
+# so a Windows build never pulls them.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", optional = true, features = ["blocking"] }
+# x11rb gates each X extension behind a feature; the MIT-SCREEN-SAVER
+# extension (x11rb::protocol::screensaver, ConnectionExt::screensaver_suspend)
+# needs the "screensaver" feature. wayland-protocols gates every unstable
+# protocol (incl. idle_inhibit) behind the "unstable" feature.
+x11rb = { version = "0.13", optional = true, features = ["screensaver"] }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", optional = true, features = ["client", "unstable"] }
+
+# Windows-only native deps. windows-sys feature set verified against the
+# 0.61.x bindings in setup.md (REASON_CONTEXT lives in Win32_System_Threading).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
