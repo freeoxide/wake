@@ -184,14 +184,19 @@ impl WakeBackend for WaylandBackend {
     fn doctor(&self) -> Result<DoctorReport> {
         let mut notes = Vec::new();
 
-        if env::var_os("WAYLAND_DISPLAY")
+        // Read WAYLAND_DISPLAY exactly once. A present-but-non-UTF8 value is
+        // reported honestly via to_string_lossy rather than masked as empty.
+        let wayland_display = env::var_os("WAYLAND_DISPLAY");
+        let available_env = wayland_display
+            .as_ref()
             .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
-            notes.push(format!(
-                "WAYLAND_DISPLAY={}",
-                env::var("WAYLAND_DISPLAY").unwrap_or_default()
-            ));
+            .unwrap_or(false);
+        if available_env {
+            let value = wayland_display
+                .as_ref()
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            notes.push(format!("WAYLAND_DISPLAY={}", value));
         } else {
             notes.push("WAYLAND_DISPLAY is not set".to_string());
         }
